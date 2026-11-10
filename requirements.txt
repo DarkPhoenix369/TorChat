@@ -1,0 +1,2 @@
+# torchat Python requirements (setup.sh installs these via your OS package manager when possible)
+cryptography>=41.0
