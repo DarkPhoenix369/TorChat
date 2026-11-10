@@ -5,20 +5,16 @@ Text, photos and documents all travel through the same encrypted channel, direct
 
 ## Quick start (3 steps)
 
-1. **Install** - put `torchat.py`, `setup.sh`, `torchat.conf` and `requirements.txt` in one folder and run `sh setup.sh`.
-2. **Start** - run `sh start.sh`. A window opens (on a phone or server you get a simple text screen instead).
-3. **Pair** - one person picks **Start a chat** and reads out the **8-word code**; the other picks **Join a chat** and types it.
-   Then both of you compare the **safety code** (by phone call or in person) and click *They match*. You're chatting.
-
 ## Which devices
 
 | Device | How |
 |---|---|
-| **Android** | Install **Termux** (from F-Droid), then `pkg install python` and `sh setup.sh`. You get the text screen. |
-| **Linux** | `sh setup.sh` (installs Tor, Python, the encryption library and the window toolkit). |
-| **macOS** | Install [Homebrew](https://brew.sh), then `sh setup.sh`. |
-| **Windows** | Install **WSL2** (`wsl --install`, then open Ubuntu) and follow the Linux steps. Windows 11 shows the window automatically. |
-| **iPhone** | Not supported. |
+| **Linux** | `pip3 install -r requirements.txt` |
+|           | `chmod +x setup.sh start.sh` |
+|           | `./setup.sh` |
+|           | `./start.sh` |
+|           | **For GUI** `python3 start-gui.py` |
+ 
 
 The two people can use different kinds of devices (for example Android and Linux).
 
