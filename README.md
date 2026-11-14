@@ -56,6 +56,7 @@ The two people can use different kinds of devices (for example Android and Linux
 
 * **Enter** sends, **Ctrl+O** sends a file, **Ctrl +** / **Ctrl −** change the text size.
 * Right-click a message to copy it.
+* **Route** (top of the chat) shows your half of the connection: your entry guard, middle relay(s) and the meeting point, with each relay's country. Your friend's half stays hidden from you, and yours from them. In the text screen, type `/route`.
 * The sun/moon button on the start screen switches between dark and light themes.
 * **End chat** closes the connection and wipes everything you received.
 

@@ -649,10 +649,7 @@ class Tor:
 
     def stop(self):
         self.stopped = True
-        if self.srv is not None:                                # wakes a host still waiting in accept()
-            try: self.srv.shutdown(socket.SHUT_RDWR)
-            except OSError: pass
-            self.srv.close()
+        self.close_listener()                                   # wakes a host still waiting in accept()
         p = self.proc
         if p and p.poll() is None:
             p.terminate()
@@ -677,7 +674,11 @@ class Tor:
         if self.use_cache: self._restore_cache()
         with open(d + "/torrc", "w") as f:
             f.write("\n".join(["DataDirectory %s/data" % d, "Log notice file %s/tor.log" % d,
-                               "AvoidDiskWrites 1", "Log [REND]info file %s/hs.log" % d]
+                               "AvoidDiskWrites 1", "Log [REND]info file %s/hs.log" % d,
+                               # private control socket (a file in our 0700 temp dir, cookie auth) - only used to
+                               # show the user their own route; never a TCP port
+                               "ControlSocket unix:%s/ctl.sock" % d, "CookieAuthentication 1",
+                               "CookieAuthFile %s/ctl.cookie" % d]
                               + self._net_lines() + lines) + "\n")
         self.t_start = time.time()
         self.proc = subprocess.Popen([tor_bin, "-f", d + "/torrc"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -754,7 +755,7 @@ class Tor:
             f.write("descriptor:x25519:%s\n" % b32(auth_pub))
         sock_path = d + "/s.sock"
         srv = socket.socket(socket.AF_UNIX)
-        srv.bind(sock_path); os.chmod(sock_path, 0o600); srv.listen(1); self.srv = srv
+        srv.bind(sock_path); os.chmod(sock_path, 0o600); srv.listen(4); self.srv = srv
         self.role = "host"
         self._start(["SocksPort 0", "HiddenServiceDir %s/hs" % d, "HiddenServicePort %d unix:%s" % (PORT, sock_path)])
         for _ in range(240):                                    # Tor writes the hostname within ~1-2 s
@@ -774,10 +775,78 @@ class Tor:
                 except OSError: pass
                 srv.close()
         threading.Thread(target=guard, daemon=True).start()
+        return self.accept_next()
+
+    def accept_next(self):
+        """Wait for the next incoming connection. The listener stays open until close_listener(), so a connection
+           that dies on its way through Tor does not use up the one-time code."""
+        srv = self.srv
+        if srv is None: raise RuntimeError(self.error or "cancelled")
         try: conn, _ = srv.accept()
         except OSError: raise RuntimeError(self.error or "cancelled")
-        srv.close()
         return conn
+
+    # ---- your own half of the route (read from Tor; never sent to the other person)
+    def _control(self, *commands):
+        """Ask our private Tor a few GETINFO questions over its control socket. Returns one list of lines per command."""
+        s = socket.socket(socket.AF_UNIX); s.settimeout(10)
+        try:
+            s.connect(self.dir + "/ctl.sock")
+            with open(self.dir + "/ctl.cookie", "rb") as f: cookie = f.read(64)
+            f = s.makefile("rwb")
+            def ask(cmd):
+                f.write((cmd + "\r\n").encode()); f.flush(); out, data = [], False
+                while True:
+                    ln = f.readline().decode("utf-8", "replace").rstrip("\r\n")
+                    if not ln and not data: raise ConnectionError("tor closed the control connection")
+                    out.append(ln)
+                    if data:
+                        if ln == ".": data = False
+                    elif re.match(r"^\d{3}\+", ln): data = True        # multi-line reply follows, ends with "."
+                    elif re.match(r"^\d{3} ", ln):
+                        if not ln.startswith("250"): raise RuntimeError("tor: " + ln[4:])
+                        return out
+            ask("AUTHENTICATE " + cookie.hex())
+            return [ask(c) for c in commands]
+        finally:
+            s.close()
+
+    def route(self):
+        """The relays of the circuit our chat uses, from us to the meeting point:
+           [{"role", "name", "ip", "country", "fp"}, ...]. Empty if not connected yet."""
+        want = "HS_SERVICE_REND" if self.role == "host" else "HS_CLIENT_REND"
+        best = None
+        for ln in self._control("GETINFO circuit-status")[0]:
+            ln = re.sub(r"^250[+-]circuit-status=", "", ln).strip()
+            p = ln.split()
+            if len(p) < 3 or p[1] != "BUILT" or "PURPOSE=" + want not in ln or "_JOINED" not in ln: continue
+            m = re.search(r"TIME_CREATED=(\S+)", ln); created = m.group(1) if m else ""
+            if best is None or created >= best[0]: best = (created, p[2])
+        if not best: return []
+        hops = []
+        relays = best[1].split(",")
+        for i, h in enumerate(relays):
+            fp, _, name = h.lstrip("$").partition("~")
+            ip = country = "?"
+            try:
+                ns = self._control("GETINFO ns/id/" + fp)[0]
+                r = next((l.split() for l in ns if l.startswith("r ")), [])
+                if len(r) > 6: name, ip = name or r[1], r[6]
+                if ip != "?":
+                    cc = self._control("GETINFO ip-to-country/" + ip)[0][0].rpartition("=")[2]
+                    country = cc.upper() if re.fullmatch(r"[a-z]{2}", cc) else "?"
+            except (OSError, RuntimeError, IndexError):
+                pass
+            role = "Entry guard" if i == 0 else ("Meeting point" if i == len(relays) - 1 else "Middle relay")
+            hops.append({"role": role, "name": name or "?", "ip": ip, "country": country, "fp": fp})
+        return hops
+
+    def close_listener(self):
+        srv, self.srv = self.srv, None
+        if srv is not None:
+            try: srv.shutdown(socket.SHUT_RDWR)                 # also wakes a thread waiting in accept()
+            except OSError: pass
+            srv.close()
 
     # ---- guest: connect to the host's onion address with the code-derived authorization key
     def join(self, onion, key):
@@ -805,6 +874,49 @@ class Tor:
         raise RuntimeError("could not reach your friend after 5 minutes: %s. "
                            "(Each time they restart, they get a NEW code - ask for the newest one.)" % last)
 
+
+
+# ======================================================================== connecting (survives dropped connections)
+HELLO_WAIT = 60          # a real peer sends its first message right after connecting; silence this long = dead connection
+CONNECTING = "Connected to your friend through Tor. Setting up encryption..."
+
+def host_handshake(tor, sock, psk, status=None, max_drops=20):
+    """Keep the invite open until one connection completes the handshake.
+       A connection can die inside Tor on its way to us (or arrive silent); that must not use up the one-time code.
+       Only network failures are retried: a failed key confirmation (wrong passphrase, tampering) or a
+       non-torchat peer still ends the session at once."""
+    drops = 0
+    while True:
+        try:
+            if status: status(CONNECTING)
+            sock.settimeout(HELLO_WAIT)
+            ratchet, sas = handshake(sock, "host", psk)
+            sock.settimeout(None)
+            tor.close_listener()                                # the code is now used up
+            return sock, ratchet, sas
+        except OSError:                                         # closed / reset / timed out (socket.timeout is an OSError)
+            try: sock.close()
+            except OSError: pass
+            drops += 1
+            if drops >= max_drops: raise RuntimeError("too many connection attempts dropped - start again with a new code")
+            if status: status("A connection attempt dropped on its way through Tor - still waiting for your friend. Keep this window open.")
+            sock = tor.accept_next()
+
+def join_handshake(tor, onion, key, psk, status=None, tries=3):
+    """Connect to the host and run the handshake; if the connection drops before the handshake finishes, connect again."""
+    for n in range(1, tries + 1):
+        sock = tor.join(onion, key)
+        try:
+            if status: status(CONNECTING)
+            sock.settimeout(180)
+            ratchet, sas = handshake(sock, "join", psk)
+            sock.settimeout(None)
+            return sock, ratchet, sas
+        except OSError:
+            try: sock.close()
+            except OSError: pass
+            if n == tries: raise
+            if status: status("The connection dropped while setting up encryption - trying again (%d of %d)..." % (n + 1, tries))
 
 
 # ======================================================================== pairing code (8 words)
@@ -1040,7 +1152,7 @@ class Messenger:
             self.set_stage("invite")                             # the code is shown at once; Tor starts now
             self.tor = Tor(self)
             sock = self.tor.host(derived)
-            self._connected(sock, "host")
+            self._connected(*host_handshake(self.tor, sock, self.psk + self.passphrase, self.set_detail), mode="host")
         except Exception as ex:
             self._fail(ex)
 
@@ -1058,8 +1170,8 @@ class Messenger:
             self.psk = derived[64:96].hex()
             self.set_stage("connecting")
             self.tor = Tor(self)
-            sock = self.tor.join(onion, b32(derived[32:64]))
-            self._connected(sock, "join")
+            self._connected(*join_handshake(self.tor, onion, b32(derived[32:64]), self.psk + self.passphrase, self.set_detail),
+                            mode="join")
         except Exception as ex:
             self._fail(ex)
 
@@ -1069,14 +1181,15 @@ class Messenger:
         threading.Thread(target=self._run_socket, args=(sock, mode), daemon=True).start()
 
     def _run_socket(self, sock, mode):
-        try: self._connected(sock, mode)
+        try:
+            self.detail = CONNECTING
+            sock.settimeout(180)
+            ratchet, sas = handshake(sock, mode, self.psk + self.passphrase)
+            sock.settimeout(None)
+            self._connected(sock, ratchet, sas, mode=mode)
         except Exception as ex: self._fail(ex)
 
-    def _connected(self, sock, mode):
-        self.detail = "Connected to your friend through Tor. Setting up encryption..."
-        sock.settimeout(180)
-        ratchet, sas = handshake(sock, mode, self.psk + self.passphrase)
-        sock.settimeout(None)
+    def _connected(self, sock, ratchet, sas, mode):
         self.sas = sas
         self.set_stage("verify")
         self.verify_evt.wait(600)
@@ -1134,6 +1247,13 @@ class Messenger:
         with os.fdopen(fd, "wb") as out, open(f["path"], "rb") as src: shutil.copyfileobj(src, out)
         return path
 
+    def route(self):
+        """Your own half of the connection, as reported by your Tor. Stays on this device."""
+        if not self.tor or self.stage != "chat": raise RuntimeError("The route is available once you are chatting.")
+        hops = self.tor.route()
+        if not hops: raise RuntimeError("Tor did not report a route for this chat.")
+        return hops
+
     def end(self):
         try:
             if self.chat:
@@ -1143,6 +1263,10 @@ class Messenger:
         except OSError: pass
         self.stage = "closed"; self.wipe()
 
+
+
+def route_lines(hops):
+    return ["%d. %-13s %-20s %-15s %s" % (i + 1, h["role"], h["name"], h["ip"], h["country"]) for i, h in enumerate(hops)]
 
 
 # ======================================================================== text interface
@@ -1232,7 +1356,7 @@ class Tui:
 
     def chat_loop(self):
         m = self.m
-        print("\n  Connected and verified. Just type to chat. Commands: /send <file>  /save <n> [folder]  /files  /help  /quit\n")
+        print("\n  Connected and verified. Just type to chat. Commands: /send <file>  /save <n> [folder]  /files  /route  /help  /quit\n")
         self.chatting = True
         while m.stage == "chat":
             try: line = input("you> ").strip()
@@ -1255,6 +1379,7 @@ class Tui:
         if cmd == "/quit": raise KeyboardInterrupt
         if cmd == "/help":
             self.say("  /send <file>        send an image or document\n  /files              list received files\n"
+                     "  /route              show your half of the route through Tor\n"
                      "  /save <n> [folder]  keep received file n (default folder: %s)\n  /quit               leave and wipe everything" % default_save_dir())
         elif cmd == "/files":
             self.say("\n".join("  [%d] %s (%s)" % (i + 1, m.files[f]["name"], human(m.files[f]["size"])) for i, f in enumerate(self.fids) if f in m.files) or "  no files yet")
@@ -1262,6 +1387,10 @@ class Tui:
             if not args or not args[0].isdigit() or not (1 <= int(args[0]) <= len(self.fids)): raise ValueError("usage: /save <number> [folder]")
             path = m.save_file(self.fids[int(args[0]) - 1], os.path.expanduser(args[1]) if len(args) > 1 else None)
             self.say("  saved to %s" % path)
+        elif cmd == "/route":
+            lines = route_lines(m.route())
+            self.say("  Your route through Tor (your friend's half is hidden from you, and yours from them):\n"
+                     "     you\n" + "\n".join("  -> " + l for l in lines) + "\n  -> (your friend's half: hidden) -> friend")
         elif cmd == "/send":
             if not args: raise ValueError("usage: /send <file>")
             path = os.path.expanduser(" ".join(args))
@@ -1501,7 +1630,8 @@ class Gui:
         self.last_sys, self.wrap, self.ready_shown, self.hint_shown, self._rewrap_job = "", 420, None, None, None
         self.sendq = queue.Queue()
         threading.Thread(target=self._sender, daemon=True).start()
-        self._home(); self._join(); self._wait(); self._verify(); self._chat(); self._error()
+        self.route_result = None
+        self._home(); self._join(); self._wait(); self._verify(); self._chat(); self._route(); self._error()
         self.apply_theme()
         self.show("home")
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -1671,6 +1801,7 @@ class Gui:
         self.chat_status = self.L(tbox, "● End-to-end encrypted · via Tor", "small", fg="ok", bg="surface")
         self.chat_status.pack(anchor="w")
         self.Button(self, hin, "End chat", self.end_chat, kind="danger-ghost", font="normal", bg="surface", pady=6).pack(side="right")
+        self.Button(self, hin, "Route", self.show_route, kind="ghost", font="normal", bg="surface", pady=6).pack(side="right", padx=(0, 4))
         self.sas_lbl = self.L(hin, "", "small", fg="muted", bg="surface", justify="right", anchor="e")
         self.sas_lbl.pack(side="right", padx=14)
         self.reg(tk.Frame(scr, height=1, bd=0, highlightthickness=0), bg="border").pack(fill="x")
@@ -1699,6 +1830,55 @@ class Gui:
         self.msg_win = self.msg_canvas.create_window(0, 0, window=self.msg_frame, anchor="nw")
         self.msg_frame.bind("<Configure>", lambda e: self.msg_canvas.configure(scrollregion=(0, 0, e.width, e.height)))
         self.msg_canvas.bind("<Configure>", self._on_chat_resize)
+
+    def _route(self):
+        col = self.screen("route")
+        self.Button(self, col, "\u2190 Back to chat", lambda: self.show("chat"), kind="ghost", font="normal", padx=10, pady=5).pack(anchor="w", pady=(24, 0))
+        self.L(col, "Your route through Tor", "h1").pack(anchor="w", pady=(18, 8))
+        self.L(col, "Your messages pass through these relays to a meeting point. Your friend's half, from the meeting point to "
+                    "them, is hidden from you - just as yours is hidden from them. Neither of you can see the other's IP address.",
+               fg="muted", wrap=580).pack(anchor="w")
+        self.route_box = self.F(col); self.route_box.pack(fill="x", pady=(20, 6))
+        row = self.F(col); row.pack(fill="x", pady=(8, 0))
+        self.Button(self, row, "Refresh", self.show_route, kind="secondary", font="normal", pady=6).pack(side="left")
+        self.L(row, "Only shown on this device. The route changes with each new chat; the entry guard normally stays "
+                    "the same for weeks, which is how Tor protects you.", "small", fg="muted", wrap=440).pack(side="left", padx=14)
+
+    def show_route(self):
+        for w in self.route_box.winfo_children(): w.destroy()
+        self.L(self.route_box, "Asking Tor\u2026", fg="muted").pack(anchor="w")
+        self.show("route")
+        m = self.m
+        def work():
+            try: self.route_result = (m, m.route(), None)
+            except Exception as ex: self.route_result = (m, None, str(ex))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _route_row(self, num, title, sub, tone="text"):
+        tk = self.tk
+        r = self.reg(tk.Frame(self.route_box, bd=0, highlightthickness=1), bg="surface", highlightbackground="border",
+                     highlightcolor="border")
+        r.pack(fill="x")
+        inner = self.F(r, bg="surface"); inner.pack(fill="x", padx=14, pady=10)
+        n = self.L(inner, num, "bold", fg="accent_fg", bg="surface", anchor="center"); n.configure(width=2)
+        n.pack(side="left", padx=(0, 10))
+        box = self.F(inner, bg="surface"); box.pack(side="left", fill="x", expand=True)
+        self.L(box, title, "bold", fg=tone, bg="surface").pack(anchor="w")
+        if sub: self.L(box, sub, "small", fg="muted", bg="surface").pack(anchor="w")
+
+    def _arrow(self):
+        self.L(self.route_box, "  \u2193", fg="muted").pack(anchor="w", padx=14)
+
+    def _render_route(self, hops, err):
+        for w in self.route_box.winfo_children(): w.destroy()
+        if err:
+            self.L(self.route_box, "Could not read the route: %s" % err, fg="danger", wrap=580).pack(anchor="w"); return
+        self._route_row("\u25cf", "You", "this device")
+        for i, h in enumerate(hops, 1):
+            self._arrow()
+            self._route_row(str(i), "%s  \u00b7  %s" % (h["name"], h["role"]), "%s  \u00b7  %s" % (h["ip"], h["country"]))
+        self._arrow()
+        self._route_row("?", "Your friend's half", "2-3 more relays - hidden from you", tone="muted")
 
     def _error(self):
         col = self.screen("error")
@@ -1913,7 +2093,7 @@ class Gui:
             self.add_sys("Connected. Messages are end-to-end encrypted and never saved to disk.")
             self.show("chat"); self.composer.entry.focus_set()
         elif s == "closed":
-            if self.cur == "chat":
+            if self.cur in ("chat", "route"):
                 self.banner.pack(fill="x", before=self.hint, padx=16, pady=(10, 0))
                 self.composer.entry.configure(state="disabled"); self.root.focus_set()
                 self.send_btn.set_enabled(False); self.attach_btn.set_enabled(False); self.hint.configure(text="")
@@ -1968,6 +2148,9 @@ class Gui:
                 pass
             if self.cur == "wait": self._update_wait()
             elif self.cur == "chat": self._update_chat()
+            if self.route_result is not None:
+                m, hops, err = self.route_result; self.route_result = None
+                if m is self.m: self._render_route(hops, err)
         finally:
             self.root.after(100, self.pump)
 
@@ -1977,7 +2160,7 @@ class Gui:
 
 
 # ======================================================================== self-test + entry point
-def selftest(limit=300):
+def selftest(limit=420):
     """Runs a host and a guest (two separate Tor processes) on THIS device and reports each step.
        PASS = the app and Tor work end to end here; a failing chat with another device is then a network / clock / old-code problem."""
     t0 = time.time()
@@ -1998,14 +2181,22 @@ def selftest(limit=300):
         idx = new_code(); derived = derive(parse_code(" ".join(code_words(idx))))       # same path real users take
         onion, _ = onion_from_seed(derived[:32])
         log("Step 1/4: starting the HOST Tor ...")
-        threading.Thread(target=run, args=("host", lambda: host.host(derived)), daemon=True).start()
+        psk = derived[64:96].hex()
+        def host_status(t):
+            hu.set_detail(t)
+            if "dropped" in t: log("host: " + t)
+        def guest_status(t):
+            gu.set_detail(t)
+            if "dropped" in t: log("guest: " + t)
+        threading.Thread(target=run, args=("host", lambda: host_handshake(host, host.host(derived), psk, host_status)), daemon=True).start()
         for _ in range(240):
             if os.path.exists(host.dir + "/hs/hostname") or "host_err" in res: break
             time.sleep(0.25)
         if "host_err" in res or not os.path.exists(host.dir + "/hs/hostname"):
             log("FAILED: could not start the host: %s" % res.get("host_err", "no onion address")); return 1
         log("Step 2/4: starting the GUEST Tor and looking for the host ...")
-        threading.Thread(target=run, args=("guest", lambda: guest.join(onion, b32(derived[32:64]))), daemon=True).start()
+        threading.Thread(target=run, args=("guest", lambda: join_handshake(guest, onion, b32(derived[32:64]), psk, guest_status)),
+                         daemon=True).start()
         last = ""
         while time.time() - t0 < limit and not ("host" in res and "guest" in res):
             if "host_err" in res or "guest_err" in res: break
@@ -2021,13 +2212,13 @@ def selftest(limit=300):
                 for l in u.tail[-5:]: log("  [%s tor] %s" % (who, l))
             log("What this means: if Tor is stuck below 100%, your network blocks Tor or the clock is wrong (try --bridges or --firewall).")
             return 1
-        log("Step 3/4: connected through Tor. Setting up encryption ...")
-        out = {}
-        def hs(role, sock): out[role] = handshake(sock, role, derived[64:96].hex())[1]
-        th = [threading.Thread(target=hs, args=("host", res["host"])), threading.Thread(target=hs, args=("join", res["guest"]))]
-        for t in th: t.start()
-        for t in th: t.join(60)
-        if len(out) == 2 and out["host"] == out["join"]:
+        log("Step 3/4: connected through Tor.")
+        out = {"host": res["host"][2], "join": res["guest"][2]}
+        for who, t in (("guest", guest), ("host", host)):
+            try: log("  %s route: you -> %s" % (who, " -> ".join("%s (%s)" % (h["name"], h["country"]) for h in t.route())))
+            except Exception as ex: log("  %s route: not available (%s)" % (who, ex))
+        for r in ("host", "guest"): res[r][0].close()
+        if out["host"] == out["join"]:
             ok = True
             log("Step 4/4: encrypted handshake OK. Both sides show the same safety code: %s" % out["host"])
             log("RESULT: PASS. The app and Tor work end to end on this device.")
