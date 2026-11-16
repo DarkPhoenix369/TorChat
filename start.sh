@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 # Launcher created by setup.sh
-PY='/root/.torchat-venv/bin/python'
+PY="$HOME/.torchat-venv/bin/python"; [ -x "$PY" ] || PY=python3
 cd "$(dirname "$0")" || exit 1
 CONF="torchat.conf"
 opt() { [ -f "$CONF" ] && grep -E "^$1=" "$CONF" | tail -n 1 | cut -d= -f2- | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
